@@ -1,0 +1,3 @@
+# SWTOR VR signatures and required exports (used by scripts/scan_offsets.py; the core has the same entries).
+# module | name | pattern | offset | resolve(- or r) | insnEnd
+export | RemoteRenderer.dll | ?CameraNode_SetData@RemoteRenderer@bwa@@QEAAXAEAVRenderProxyHandle@2@AEBVCameraNodeProxyData@2@@Z
