@@ -10,6 +10,7 @@
 #include <tlhelp32.h>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <vector>
 #include <string>
 #include "core.h"
@@ -31,6 +32,14 @@ static uintptr_t g_bp[4];
 static int g_nbp = 0;
 static __declspec(thread) bool t_armed = false;
 static volatile LONG g_bpHits = 0;
+// Split mode (CullSplit = 1): instead of a wider FOV, the culling view gets the game's own vertical FOV (x
+// CullVertBoost in tangent) and a wider ASPECT, by editing the arguments of the call that builds it
+// (swtor.exe+0x77d4c0: [rsp+20] = vertical FOV, [rsp+28] = aspect) at the call instruction. Objects keep their
+// on-screen height, so the game's "too small to draw" test is not fooled (no pop-in straight ahead).
+static bool g_split = true;
+static float g_vertBoost = 1.5f;
+static volatile float g_widenTan = 1.0f;   // wanted horizontal widening (tangent ratio)
+static int g_logDraws = 0;
 
 // learn phase (data watch on the FOV)
 static bool g_learning = false;
@@ -39,6 +48,9 @@ static volatile LONG g_nNext = 0;
 
 void CullSites_LoadSettings(const xrb::Config& c) {
     g_scan = c.GetInt("DebugCullSiteScan", 0);
+    g_split = c.GetBool("CullSplit", true);
+    g_vertBoost = c.GetFloat("CullVertBoost", 1.5f);
+    g_logDraws = c.GetInt("DebugLogDraws", 0);
     g_cfgSites.clear();
     std::string s = c.GetStr("CullSites", "auto");
     g_siteMode = (s.empty() || s == "auto") ? 0 : (s == "off" || s == "0") ? 2 : 1;
@@ -98,6 +110,21 @@ static LONG CALLBACK Veh(EXCEPTION_POINTERS* ep) {
     for (int i = 0; i < g_nbp; i++) {
         if (ip == g_bp[i] && (c->Dr6 & (1ull << i))) {
             c->Dr6 = 0;
+            if (g_split) {
+                float* fv = (float*)(c->Rsp + 0x20);
+                float* asp = (float*)(c->Rsp + 0x28);
+                float w = g_widenTan;
+                if (g_wide > 0 && w > 1.001f && *fv > 0.05f && *fv < 3.0f && *asp > 0.2f && *asp < 20.f) {
+                    float vb = g_vertBoost < 1.f ? 1.f : g_vertBoost;
+                    float t = tanf(*fv * 0.5f) * vb;
+                    if (t > 20.f) t = 20.f;
+                    *fv = 2.f * atanf(t);
+                    *asp = *asp * w / vb;
+                }
+                c->EFlags |= 0x10000u;
+                InterlockedIncrement(&g_bpHits);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
             if (g_fov && g_wide > 0) { *g_fov = g_wide; t_armed = true; c->EFlags |= 0x100u; }
             c->EFlags |= 0x10000u;   // RF: run the instruction without hitting the breakpoint again
             InterlockedIncrement(&g_bpHits);
@@ -234,6 +261,14 @@ static const char* PhaseName(int p, char* b, size_t n) {
 void CullSites_Frame(float* fovAddr, float orig, float wide) {
     if (!fovAddr || orig <= 0) return;
     g_fov = fovAddr; g_orig = orig; g_wide = wide;
+    g_widenTan = tanf(wide * 0.5f) / tanf(orig * 0.5f);
+    if (g_logDraws) {   // test aid: average draws per frame every 4 s
+        static uint64_t sum = 0, n = 0; static DWORD t0 = 0;
+        DWORD now = GetTickCount();
+        if (!t0) t0 = now;
+        sum += Trace_LastFrameDraws(); n++;
+        if (now - t0 >= 4000) { LOGI("cullsite: %.0f draws/frame (split %d, vert %.2f, widen x%.1f, bp hits %ld)", n ? (double)sum / n : 0.0, g_split, g_vertBoost, g_widenTan, InterlockedExchange(&g_bpHits, 0)); sum = n = 0; t0 = now; }
+    }
     DWORD now = GetTickCount();
     switch (g_state) {
     case S_IDLE:
@@ -254,7 +289,7 @@ void CullSites_Frame(float* fovAddr, float orig, float wide) {
                 bool ok = true;
                 for (const SiteSig& sg : kSites) {
                     std::vector<uintptr_t> m = FindPattern(sg.pat);
-                    if (m.size() == 1) a[n++] = m[0] + sg.off;
+                    if (m.size() == 1) a[n++] = m[0] + sg.off + (g_split ? 14 : 0);   // split: the call after the load
                     else { ok = false; LOGW("cullsite: signature '%s' found %zu times (need exactly 1)", sg.name, m.size()); }
                 }
                 if (!ok || n == 0) {
@@ -273,7 +308,8 @@ void CullSites_Frame(float* fovAddr, float orig, float wide) {
             g_memWide = false;
             SetBreakpoints(a, n);
             g_state = S_ACTIVE;
-            LOGI("cullsite: wide FOV only for %d culling reader(s); everything else (mouse picking, sky) sees the game FOV", n);
+            if (g_split) LOGI("cullsite: split mode - the culling view gets a wider aspect (x boost / %.2f) and the game's vertical FOV x %.2f; nothing else changes", g_vertBoost, g_vertBoost);
+            else LOGI("cullsite: wide FOV only for %d culling reader(s); everything else (mouse picking, sky) sees the game FOV", n);
         } else g_state = S_DONE;
         break;
     case S_LEARN:

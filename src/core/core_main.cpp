@@ -21,7 +21,7 @@
 #ifndef SVR_BUILD_ID
 #define SVR_BUILD_ID "dev"
 #endif
-#define CORE_VERSION "1.0.1+" SVR_BUILD_ID
+#define CORE_VERSION "1.0.2+" SVR_BUILD_ID
 
 namespace svr {
 
@@ -73,6 +73,10 @@ static const char* kDefaultConfig =
     "# Which game code sees the widened FOV: auto = only the culling code found by signature (mouse picking keeps\n"
     "# working); off = widen everywhere (old behaviour: clicking world objects fails at a high boost).\n"
     "CullSites = auto\n"
+    "# Culling boost widens sideways only (keeps object sizes, so nothing pops in straight ahead); 0 = widen the FOV.\n"
+    "CullSplit = 1\n"
+    "# Extra vertical room for the culling view when CullSplit = 1 (for looking up / down), as a tangent factor.\n"
+    "CullVertBoost = 1.5\n"
     "# Draw the game's own mouse pointer (talk, loot, taxi, ...) in the headset; 0 = a plain arrow.\n"
     "GamePointer = 1\n"
     "# Luma sharpen (ReShade LumaSharpen): strength (0 = off), clamp, radius.\n"

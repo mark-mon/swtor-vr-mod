@@ -20,7 +20,7 @@ SWTOR is a 64-bit Direct3D 9 game. Its renderer lives in `RemoteRenderer.dll`, w
 Notable pieces:
 
 - **Render scale** (`sceneres.cpp`): only the renderer sees a larger window, so the 3D scene renders above window size while the UI keeps its layout.
-- **Culling boost** (`cull.cpp`, `cullsite.cpp`): the game's visibility culling uses the flat camera's FOV, so objects vanish when you turn your head. The camera FOV in memory stays as the game set it. An execute breakpoint gives a widened value to the one instruction that feeds culling, which is found by signature at runtime. Mouse picking and the sky keep the real FOV, so clicking world objects still works.
+- **Culling boost** (`cull.cpp`, `cullsite.cpp`): the game's visibility culling uses the flat camera's FOV, so objects vanish when you turn your head. The camera FOV in memory stays as the game set it. An execute breakpoint on the call that builds the culling view (found by signature at runtime) widens only its aspect ratio, plus a little height. Objects keep their on-screen size for the game's "too small to draw" check, so nothing pops in ahead. Mouse picking and the sky keep the real FOV, so clicking world objects still works.
 - **HUD capture** (`hud.cpp`): redirects everything drawn after the 3D scene into a texture with forced alpha. Back-buffer re-binds in the middle of the UI pass are redirected too.
 
 `docs/CLAUDE_NOTES.md` has the full reverse-engineering notes (renderer API, frame structure, camera data layout, what was tried and why).
