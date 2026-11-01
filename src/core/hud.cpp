@@ -22,13 +22,20 @@ static HudSettings g_hs;
 static IDirect3DTexture9* g_hudTex = nullptr;
 static IDirect3DSurface9* g_hudSurf = nullptr;
 static IDirect3DSurface9* g_savedRT = nullptr;
+// With in-game MSAA the game's depth-stencil is multisampled, and D3D9 drops draws into our (non-multisampled) HUD
+// target while it is bound: UI that uses depth or stencil (Scaleform masks: the conversation wheel) vanished.
+// Then the UI gets a matching depth-stencil of its own while it is captured.
+static IDirect3DSurface9* g_hudDS = nullptr;     // ours (HUD size, no MSAA)
+static IDirect3DSurface9* g_savedDS = nullptr;   // the game's, put back at the end of the capture
+static bool g_ownDS = false, g_allowOwnDS = true;   // HudOwnDepth
+static uint64_t g_dsSwaps = 0;
 static IDirect3DTexture9* g_cursorTex = nullptr;
 static unsigned g_w = 0, g_h = 0;          // HUD (UI) size
 static unsigned g_bbW = 0, g_bbH = 0;      // back buffer size (scene)
 static bool g_capturing = false, g_haveHud = false;
 static uint64_t g_frames = 0;
 static IDirect3DSurface9* g_curRT0 = nullptr;      // what the game last bound as RT0 while capturing (after our redirect)
-static uint64_t g_rtToBB = 0, g_rtOther = 0, g_drawsOff = 0, g_drawsHud = 0;
+static uint64_t g_rtToBB = 0, g_rtOther = 0, g_drawsOff = 0, g_drawsHud = 0, g_drawsOutside = 0;
 static bool g_redirect = true;
 
 typedef HRESULT(STDMETHODCALLTYPE* PFN_SetRS)(IDirect3DDevice9*, D3DRENDERSTATETYPE, DWORD);
@@ -47,6 +54,7 @@ void Hud_LoadSettings(const xrb::Config& c) {
     g_hs.alphaMode = c.GetInt("HudAlphaMode", 1);
     g_hs.debugDumpAfterSec = c.GetInt("DebugHudDumpAfterSec", 0);
     g_redirect = c.GetBool("HudRedirectBackBuffer", true);
+    g_allowOwnDS = c.GetBool("HudOwnDepth", true);
 }
 const HudSettings& Hud_Settings() { return g_hs; }
 bool Hud_Capturing() { return g_capturing; }
@@ -113,7 +121,21 @@ void Hud_BeginCapture(IDirect3DDevice9* dev) {
     if (!EnsureTex(dev)) return;
     if (FAILED(dev->GetRenderTarget(0, &g_savedRT))) { g_savedRT = nullptr; return; }
     dev->SetRenderTarget(0, g_hudSurf);
-    dev->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_ARGB(0, 0, 0, 0), 1.f, 0);
+    g_ownDS = false;
+    if (g_allowOwnDS && SUCCEEDED(dev->GetDepthStencilSurface(&g_savedDS)) && g_savedDS) {
+        D3DSURFACE_DESC d;
+        if (SUCCEEDED(g_savedDS->GetDesc(&d)) && (d.MultiSampleType != D3DMULTISAMPLE_NONE || d.Width < g_w || d.Height < g_h)) {
+            if (!g_hudDS && FAILED(dev->CreateDepthStencilSurface(g_w, g_h, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, FALSE, &g_hudDS, nullptr)))
+                g_hudDS = nullptr;
+            if (g_hudDS) {
+                static bool logged = false;
+                if (!logged) { logged = true; LOGI("hud: game depth buffer is multisampled (in-game MSAA %d) - the UI gets its own depth-stencil", (int)d.MultiSampleType); }
+                dev->SetDepthStencilSurface(g_hudDS);
+                g_ownDS = true;
+            }
+        }
+    }
+    dev->Clear(0, nullptr, D3DCLEAR_TARGET | (g_ownDS ? D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL : 0), D3DCOLOR_ARGB(0, 0, 0, 0), 1.f, 0);
     g_curRT0 = g_hudSurf;
     g_capturing = true;
     if (g_hs.alphaMode) ForceAlpha(dev);
@@ -313,8 +335,13 @@ IDirect3DSurface9* Hud_FilterRT(DWORD index, IDirect3DSurface9* s) {
     g_curRT0 = s;
     return s;
 }
+IDirect3DSurface9* Hud_FilterDS(IDirect3DSurface9* s) {
+    if (!g_capturing || !g_ownDS || !s || s != g_savedDS) return s;
+    g_dsSwaps++;
+    return g_hudDS;
+}
 void Hud_OnDraw() {
-    if (!g_capturing) return;
+    if (!g_capturing) { if (Stereo_Pass() == 0) g_drawsOutside++; return; }
     if (g_curRT0 == g_hudSurf) g_drawsHud++; else g_drawsOff++;
 }
 
@@ -329,6 +356,12 @@ bool Hud_EndCapture(IDirect3DDevice9* dev) {
         dev->SetRenderTarget(0, g_hudSurf);
         DrawCursorAt(dev, r);
     }
+    if (g_savedDS) {   // the game's depth-stencil back (state blocks don't include it)
+        if (g_ownDS) dev->SetDepthStencilSurface(g_savedDS);
+        g_savedDS->Release();
+        g_savedDS = nullptr;
+    }
+    g_ownDS = false;
     if (g_savedRT) {
         dev->SetRenderTarget(0, g_savedRT);
         DrawQuad(dev, g_hudTex, 0, 0, (float)g_bbW, (float)g_bbH, 0xFFFFFFFF, true);   // HUD over the monitor image
@@ -364,6 +397,13 @@ void Hud_Release() {
         g_savedRT->Release();
         g_savedRT = nullptr;
     }
+    if (g_savedDS) {
+        if (g_ownDS && g_api && g_api->device) g_api->device->SetDepthStencilSurface(g_savedDS);
+        g_savedDS->Release();
+        g_savedDS = nullptr;
+    }
+    g_ownDS = false;
+    if (g_hudDS) { g_hudDS->Release(); g_hudDS = nullptr; }
     if (g_hudSurf) { g_hudSurf->Release(); g_hudSurf = nullptr; }
     if (g_hudTex) { g_hudTex->Release(); g_hudTex = nullptr; }
     if (g_cursorTex) { g_cursorTex->Release(); g_cursorTex = nullptr; }
@@ -373,10 +413,11 @@ void Hud_Release() {
 }
 
 void Hud_LogStats() {
-    LOGI("hud: %llu captured frames (layer %s, %ux%u); UI draws %llu to HUD, %llu elsewhere; back buffer re-bound %llu x (%s), other targets %llu x",
-         (unsigned long long)g_frames, g_hs.enabled ? "on" : "off", g_w, g_h, (unsigned long long)g_drawsHud, (unsigned long long)g_drawsOff,
+    LOGI("hud: %llu captured frames (layer %s, %ux%u); UI draws %llu to HUD, %llu elsewhere, %llu outside the capture; back buffer re-bound %llu x (%s), other targets %llu x",
+         (unsigned long long)g_frames, g_hs.enabled ? "on" : "off", g_w, g_h, (unsigned long long)g_drawsHud, (unsigned long long)g_drawsOff, (unsigned long long)g_drawsOutside,
          (unsigned long long)g_rtToBB, g_redirect ? "redirected" : "not redirected", (unsigned long long)g_rtOther);
-    g_drawsHud = g_drawsOff = g_rtToBB = g_rtOther = 0;
+    if (g_dsSwaps) LOGI("hud: game depth-stencil swapped for the HUD's %llu x", (unsigned long long)g_dsSwaps);
+    g_drawsHud = g_drawsOff = g_rtToBB = g_rtOther = g_dsSwaps = g_drawsOutside = 0;
     g_frames = 0;
 }
 

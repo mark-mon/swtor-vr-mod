@@ -135,6 +135,7 @@ static HRESULT STDMETHODCALLTYPE Hk_SetRT(IDirect3DDevice9* d, DWORD i, IDirect3
 }
 static HRESULT STDMETHODCALLTYPE Hk_SetDS(IDirect3DDevice9* d, IDirect3DSurface9* s) {
     HOOK_GUARD;
+    s = Hud_FilterDS(s);
     if (g_tracing) { char b[96]; Desc(s, b, sizeof(b)); Trace_Event("SetDepthStencil %s", b); }
     return o_SetDS(d, s);
 }

@@ -21,7 +21,7 @@
 #ifndef SVR_BUILD_ID
 #define SVR_BUILD_ID "dev"
 #endif
-#define CORE_VERSION "1.0.0+" SVR_BUILD_ID
+#define CORE_VERSION "1.0.1+" SVR_BUILD_ID
 
 namespace svr {
 
@@ -89,6 +89,11 @@ std::atomic<int> g_hookDepth{0};
 std::atomic<bool> g_shuttingDown{false};
 static bool g_mhInit = false;
 static int g_traceFramesCfg = 0, g_watchFramesCfg = 0;
+// Diagnostics for conversations (TraceCinematics = 1, off by default; a few per game session): when the game enters a
+// cinematic / conversation, one frame is traced 1.5 s and 8 s later (the dialog wheel appears after the NPC speaks).
+static int g_traceCinematics = 0;
+static volatile LONG g_cinematicEntered = 0;
+static int g_cinematicsTraced = 0;
 
 // --- renderer API probe: resolve exports by name and count calls (thread + rate) ---------------------------------
 struct Probe {
@@ -143,6 +148,7 @@ static uintptr_t __fastcall ProbeDetour(uintptr_t a, uintptr_t b, uintptr_t c, u
     HOOK_GUARD;
     g_probes[I].calls++;
     g_probes[I].lastThread = GetCurrentThreadId();
+    if (I == 3) InterlockedExchange(&g_cinematicEntered, 1);   // EnterCinematic
     if (!Trace_Active()) return ((Fn8)g_probes[I].orig)(a, b, c, d, e, f, g, h);
     Trace_Enter(g_probes[I].shortName);
     uintptr_t r = ((Fn8)g_probes[I].orig)(a, b, c, d, e, f, g, h);
@@ -220,6 +226,15 @@ static void OnPresentBegin(IDirect3DDevice9* dev, IDirect3DSwapChain9*) {
     if (!g_renderThread) { g_renderThread = GetCurrentThreadId(); LOGI("first Present on thread %lu", g_renderThread); }
     static uint64_t frameNo = 0;
     if (++frameNo == 600 && g_traceFramesCfg > 0) Trace_Request(g_traceFramesCfg);
+    {
+        static uint64_t cineAt = 0;
+        if (InterlockedExchange(&g_cinematicEntered, 0) && g_traceCinematics && g_cinematicsTraced < 3) {
+            cineAt = frameNo; g_cinematicsTraced++;
+            LOGI("diag: cinematic / conversation started - tracing a frame in 1.5 s and 8 s");
+        }
+        if (cineAt && (frameNo == cineAt + 135 || frameNo == cineAt + 720)) { Trace_Request(1); Hud_LogStats(); }
+        if (cineAt && frameNo > cineAt + 720) cineAt = 0;
+    }
     if (g_watchFramesCfg > 0 && frameNo == 600) Watch_Start(Camera_ActiveNode());
     if (g_watchFramesCfg > 0 && frameNo == 600 + (uint64_t)g_watchFramesCfg) Watch_Stop();
     Cull_Frame();
@@ -258,8 +273,10 @@ static void LogCallers(const char* what) {
     LOGI("%s", line);
 }
 static int g_resetLogs = 0;
+static int g_debugForceMsaa = 0;   // test aid: DebugForceMSAA = 2/4/8 forces multisampling on the next device reset
 static void OnPreReset(IDirect3DDevice9*, D3DPRESENT_PARAMETERS* pp) {
-    LOGI("pre-Reset %ux%u", pp->BackBufferWidth, pp->BackBufferHeight);
+    if (g_debugForceMsaa >= 2 && pp->SwapEffect == D3DSWAPEFFECT_DISCARD) { pp->MultiSampleType = (D3DMULTISAMPLE_TYPE)g_debugForceMsaa; pp->MultiSampleQuality = 0; }
+    LOGI("pre-Reset %ux%u ms %d", pp->BackBufferWidth, pp->BackBufferHeight, (int)pp->MultiSampleType);
     SceneRes_NoteReset();
     if (g_resetLogs++ < 6) LogCallers("Reset");
     Vr_OnPreReset();
@@ -290,6 +307,7 @@ extern "C" __declspec(dllexport) bool __cdecl SwtorVR_CoreInit(LoaderApi* api, C
         Camera_LoadSettings(cfg);
         Stereo_LoadSettings(cfg);
         Hud_LoadSettings(cfg);
+        g_debugForceMsaa = cfg.GetInt("DebugForceMSAA", 0);
         SceneRes_LoadSettings(cfg);
         Trace_LoadSettings(cfg);
         Menu_LoadSettings(cfg);
@@ -309,6 +327,7 @@ extern "C" __declspec(dllexport) bool __cdecl SwtorVR_CoreInit(LoaderApi* api, C
             }
         }
         g_traceFramesCfg = cfg.GetInt("DebugTraceFrames", 0);
+        g_traceCinematics = cfg.GetInt("TraceCinematics", 0);
         g_watchFramesCfg = cfg.GetInt("DebugWatchCameraFrames", 0);
         LOGI("config: VR=%d TheaterDistance=%.2f TheaterWidth=%.2f", Vr_Settings().enabled, Vr_Settings().theaterDistance, Vr_Settings().theaterWidth);
     }

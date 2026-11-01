@@ -109,6 +109,7 @@ void Hud_Release();
 void Hud_LogStats();
 IDirect3DSurface9* Hud_FilterRT(DWORD index, IDirect3DSurface9* s);   // SetRenderTarget while capturing
 void Hud_OnDraw();
+IDirect3DSurface9* Hud_FilterDS(IDirect3DSurface9* s);
 void Hud_DrawCursorOnto(IDirect3DDevice9* dev, IDirect3DSurface9* target, const RECT& rect);
 bool Vr_StereoReady();
 bool Vr_BeginStereoFrame();
