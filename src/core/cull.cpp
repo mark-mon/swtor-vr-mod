@@ -34,7 +34,7 @@ static DWORD g_watchT0 = 0, g_watchLast = 0;
 void Cull_LoadSettings(const xrb::Config& c) {
     g_watchSec = c.GetInt("DebugWatchCullFov", 0);
     CullSites_LoadSettings(c);
-    g_widen = c.GetFloat("CullWiden", 30.0f);
+    g_widen = c.GetFloat("CullFovBoostV2", 2.0f);   // "CullWiden" (v1.0.2 and older, default 30) is ignored on purpose
     g_aspectBoost = 1.0f;   // CullAspect removed: no effect on culling, breaks the sky fix (kept off)
     if (g_aspectBoost < 1.0f) g_aspectBoost = 1.0f;
     if (g_aspectBoost > 3.0f) g_aspectBoost = 3.0f;
@@ -146,7 +146,8 @@ void Cull_Frame() {
     if (sent <= 0 || !Stereo_GameNearFar(&nearZ, &farZ)) return;
     bool want = (g_widen > 1.001f || g_aspectBoost > 1.001f) && !Vr_FlatMode();   // flat mode shows the game camera: keep it
     float orig = OrigFov();
-    if (!want || !g_nAddr) CullSites_Pause();
+    bool needMem = CullSites_NeedsMemory();
+    if (!want || (!g_nAddr && needMem)) CullSites_Pause();
     if (!want) {
         if (orig > 0 && g_nAddr) {
             float oa[3] = { OrigAsp(0), OrigAsp(1), OrigAsp(2) };
@@ -157,13 +158,14 @@ void Cull_Frame() {
         return;
     }
     if (orig <= 0) { orig = sent; SetOrigFov(orig); LOGI("cull: game FOV %.4f rad (%.1f deg)", orig, orig * 57.2958f); }
+    float target = 2.f * atanf(tanf(orig * 0.5f) * g_widen);
+    if (target > 3.0f) target = 3.0f;   // 172 deg vertical (175 horizontal); the projection breaks down towards 180
     if (g_nAddr == 0) {
+        if (!needMem) { CullSites_Frame(nullptr, orig, target); return; }   // split mode: works without the camera address
         // search for the value the game sends (the original; or our widened one after a core reload)
         if (!g_scanning && GetTickCount() - g_lastScan > 10000) StartScan(sent, nearZ, farZ);
         return;
     }
-    float target = 2.f * atanf(tanf(orig * 0.5f) * g_widen);
-    if (target > 3.0f) target = 3.0f;   // 172 deg vertical (175 horizontal); the projection breaks down towards 180
     static float lastLogged = -1.f;
     if (fabsf(g_widen - lastLogged) > 1e-3f) {
         lastLogged = g_widen;

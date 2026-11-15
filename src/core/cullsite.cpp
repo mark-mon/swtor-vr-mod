@@ -40,17 +40,49 @@ static bool g_split = true;
 static float g_vertBoost = 1.5f;
 static volatile float g_widenTan = 1.0f;   // wanted horizontal widening (tangent ratio)
 static int g_logDraws = 0;
+// Head-aimed culling (CullHeadAim = 1): the culling view also turns with the head (the game camera, the character and
+// the image stay as they are) and covers the headset's own field of view x CullHeadMargin. [rdx] at the call = the
+// culling view matrix (world -> camera, row-vector; same camera axes as the eye cameras): M' = M * inverse(head).
+static bool g_headAim = false;
+static float g_headMargin = 1.35f;
+static float g_headR[3][3];
+static float g_headTan[4];
+static volatile bool g_headOk = false;
+static bool g_headFlip = false;
+static int g_headMirror = 3;   // DebugCullHeadFlip: which way the culling view turns (test aid)
 
 // learn phase (data watch on the FOV)
 static bool g_learning = false;
 static uintptr_t g_next[32], g_start[32];
 static volatile LONG g_nNext = 0;
 
+static float g_lastM[16], g_lastM2[16];
+static bool g_rowMix = true;
+// Candidate axis conventions for head-aimed culling (mirror axis, flip) - all four pass the simulated poses.
+// {mirror axis, flip, rowmix}. v0 = measured best 2026-11-14 (culling space = camera space with z mirrored).
+static const int kVariant[4][3] = { { 3, 0, 1 }, { 0, 1, 1 }, { 1, 0, 1 }, { 2, 1, 1 } };
+void CullSites_SetVariant(int v) {
+    if (v < 0 || v > 3) v = 0;
+    g_headMirror = kVariant[v][0]; g_headFlip = kVariant[v][1] != 0; g_rowMix = kVariant[v][2] != 0;
+    LOGI("cullsite: head culling variant %d (mirror %d, flip %d)", v, g_headMirror, (int)g_headFlip);
+}
+void CullSites_SetHead(bool aim, float margin, float vert) {
+    g_headAim = aim;
+    g_headMargin = margin < 1.f ? 1.f : margin;
+    g_vertBoost = vert < 1.f ? 1.f : vert;
+}
 void CullSites_LoadSettings(const xrb::Config& c) {
     g_scan = c.GetInt("DebugCullSiteScan", 0);
     g_split = c.GetBool("CullSplit", true);
-    g_vertBoost = c.GetFloat("CullVertBoost", 1.5f);
+    g_vertBoost = c.GetFloat("DebugCullVertBoost", 1.0f);   // only without head aim
     g_logDraws = c.GetInt("DebugLogDraws", 0);
+    g_headAim = c.GetBool("DebugCullHeadAim", true);
+    g_headMargin = c.GetFloat("CullHeadMarginV2", 1.0f);
+    g_headFlip = c.GetInt("DebugCullHeadFlip", 0) != 0;
+    g_headMirror = c.GetInt("DebugCullHeadMirror", 3);
+    g_rowMix = c.GetBool("DebugCullHeadRowMix", true);
+    { int v = c.GetInt("DebugCullHeadVariant", 0); if (v >= 0) CullSites_SetVariant(v); }
+    if (g_headMargin < 1.f) g_headMargin = 1.f;
     g_cfgSites.clear();
     std::string s = c.GetStr("CullSites", "auto");
     g_siteMode = (s.empty() || s == "auto") ? 0 : (s == "off" || s == "0") ? 2 : 1;
@@ -110,6 +142,42 @@ static LONG CALLBACK Veh(EXCEPTION_POINTERS* ep) {
     for (int i = 0; i < g_nbp; i++) {
         if (ip == g_bp[i] && (c->Dr6 & (1ull << i))) {
             c->Dr6 = 0;
+            if (g_split && g_headAim && g_headOk && g_wide > 0) {
+                float* fv = (float*)(c->Rsp + 0x20);
+                float* asp = (float*)(c->Rsp + 0x28);
+                float* M = (float*)c->Rdx;
+                if (*fv > 0.05f && *fv < 3.0f && *asp > 0.2f && *asp < 20.f && M) {
+                    // rotate: rows of M times R^T (R = head rotation in camera space, orthonormal)
+                    memcpy(g_lastM, M, sizeof(g_lastM));
+                    if (g_rowMix) {                  // M = camera -> world: rotate the camera's axis rows, keep its position
+                        float o[3][4];
+                        for (int i = 0; i < 3; i++) for (int k = 0; k < 4; k++) {
+                            float a = 0.f;
+                            for (int j = 0; j < 3; j++) a += (g_headFlip ? g_headR[j][i] : g_headR[i][j]) * M[j * 4 + k];
+                            o[i][k] = a;
+                        }
+                        for (int i = 0; i < 3; i++) for (int k = 0; k < 4; k++) M[i * 4 + k] = o[i][k];
+                    } else
+                    for (int r = 0; r < 4; r++) {
+                        float x = M[r * 4 + 0], y = M[r * 4 + 1], z = M[r * 4 + 2];
+                        for (int k = 0; k < 3; k++) M[r * 4 + k] = g_headFlip ? x * g_headR[0][k] + y * g_headR[1][k] + z * g_headR[2][k]
+                                                                         : x * g_headR[k][0] + y * g_headR[k][1] + z * g_headR[k][2];
+                    }
+                    memcpy(g_lastM2, M, sizeof(g_lastM2));
+                    float th = (g_headTan[0] > g_headTan[1] ? g_headTan[0] : g_headTan[1]) * g_headMargin;
+                    float tv = (g_headTan[2] > g_headTan[3] ? g_headTan[2] : g_headTan[3]) * g_headMargin;
+                    float tg = tanf(*fv * 0.5f);
+                    if (tv < tg) tv = tg;                       // never narrower than the game's own view
+                    if (th < tg * *asp) th = tg * *asp;
+                    { float hw = tg * *asp * g_widenTan; if (th < hw) th = hw; }   // keep the normal horizontal widening
+                    if (tv > 20.f) tv = 20.f;
+                    *fv = 2.f * atanf(tv);
+                    *asp = th / tv;
+                }
+                c->EFlags |= 0x10000u;
+                InterlockedIncrement(&g_bpHits);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
             if (g_split) {
                 float* fv = (float*)(c->Rsp + 0x20);
                 float* asp = (float*)(c->Rsp + 0x28);
@@ -258,16 +326,47 @@ static const char* PhaseName(int p, char* b, size_t n) {
     return b;
 }
 
+// Split mode reads the game's FOV from the culling call itself: it needs no camera address in memory.
+bool CullSites_NeedsMemory() { return !g_split || g_scan > 0 || g_siteMode == 2 || g_state == S_DONE; }
 void CullSites_Frame(float* fovAddr, float orig, float wide) {
-    if (!fovAddr || orig <= 0) return;
+    if (orig <= 0 || (!fovAddr && CullSites_NeedsMemory())) return;
     g_fov = fovAddr; g_orig = orig; g_wide = wide;
     g_widenTan = tanf(wide * 0.5f) / tanf(orig * 0.5f);
+    if (g_headAim) {
+        float R[3][3], t4[4];
+        bool ok = Stereo_HeadRotation(R, t4);
+        if (ok) {
+            // the culling camera's x axis is mirrored relative to the eye cameras (measured: yaw turned the wrong way,
+            // pitch the right way): conjugate with diag(-1,1,1)
+            // DebugCullHeadMirror: 0 none, 1 x, 2 y, 3 z (conjugate with a mirror of that axis)
+            if (g_headMirror >= 1 && g_headMirror <= 3) {
+                int a = g_headMirror - 1;
+                for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) if ((i == a) != (j == a)) R[i][j] = -R[i][j];
+            }
+            memcpy(g_headR, R, sizeof(R)); memcpy(g_headTan, t4, sizeof(t4));
+        }
+        g_headOk = ok;
+        static DWORD lastLog = 0;
+        DWORD now = GetTickCount();
+        if (ok && now - lastLog > 2000) {
+            lastLog = now;
+            float th = (t4[0] > t4[1] ? t4[0] : t4[1]) * g_headMargin, tv = (t4[2] > t4[3] ? t4[2] : t4[3]) * g_headMargin;
+            LOGI("cullhead: R [%.2f %.2f %.2f | %.2f %.2f %.2f | %.2f %.2f %.2f] tan L%.2f R%.2f U%.2f D%.2f -> view %.0f x %.0f deg, mirror %d flip %d",
+                 R[0][0], R[0][1], R[0][2], R[1][0], R[1][1], R[1][2], R[2][0], R[2][1], R[2][2], t4[0], t4[1], t4[2], t4[3],
+                 2.f * atanf(th) * 57.3f, 2.f * atanf(tv) * 57.3f, g_headMirror, (int)g_headFlip);
+            const float* a = g_lastM; const float* b = g_lastM2;
+            LOGI("cullhead: M in  [%.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.1f %.1f %.1f %.2f] rowmix %d",
+                 a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7],a[8],a[9],a[10],a[11],a[12],a[13],a[14],a[15], (int)g_rowMix);
+            LOGI("cullhead: M out [%.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.1f %.1f %.1f %.2f]",
+                 b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+        }
+    }
     if (g_logDraws) {   // test aid: average draws per frame every 4 s
         static uint64_t sum = 0, n = 0; static DWORD t0 = 0;
         DWORD now = GetTickCount();
         if (!t0) t0 = now;
         sum += Trace_LastFrameDraws(); n++;
-        if (now - t0 >= 4000) { LOGI("cullsite: %.0f draws/frame (split %d, vert %.2f, widen x%.1f, bp hits %ld)", n ? (double)sum / n : 0.0, g_split, g_vertBoost, g_widenTan, InterlockedExchange(&g_bpHits, 0)); sum = n = 0; t0 = now; }
+        if (now - t0 >= 4000) { LOGI("cullsite: %.0f draws/frame (split %d, head aim %d/%d, vert %.2f, widen x%.1f, bp hits %ld)", n ? (double)sum / n : 0.0, g_split, g_headAim, (int)g_headOk, g_vertBoost, g_widenTan, InterlockedExchange(&g_bpHits, 0)); sum = n = 0; t0 = now; }
     }
     DWORD now = GetTickCount();
     switch (g_state) {
@@ -308,7 +407,8 @@ void CullSites_Frame(float* fovAddr, float orig, float wide) {
             g_memWide = false;
             SetBreakpoints(a, n);
             g_state = S_ACTIVE;
-            if (g_split) LOGI("cullsite: split mode - the culling view gets a wider aspect (x boost / %.2f) and the game's vertical FOV x %.2f; nothing else changes", g_vertBoost, g_vertBoost);
+            if (g_split && g_headAim) LOGI("cullsite: head-aimed culling - the culling view turns with the head and covers the headset FOV x %.2f", g_headMargin);
+            else if (g_split) LOGI("cullsite: split mode - the culling view gets a wider aspect (x boost / %.2f) and the game's vertical FOV x %.2f; nothing else changes", g_vertBoost, g_vertBoost);
             else LOGI("cullsite: wide FOV only for %d culling reader(s); everything else (mouse picking, sky) sees the game FOV", n);
         } else g_state = S_DONE;
         break;

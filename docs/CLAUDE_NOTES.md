@@ -163,3 +163,11 @@ One game frame on the single render/game thread:
 - Reader B (`swtor.exe+0x53bf15`) feeds `swtor.exe+0x77d4c0(this, view, width, height, [rsp+20] vertical FOV, [rsp+28] aspect, [rsp+30] near, [rsp+38] far)`. That function computes top = near*tan(fov/2) and right = top*aspect, and passes the frustum box (l,r,t,b,n,f) to the culling object (`0x1409c18e0`).
 - Split mode (`CullSplit = 1`, default): an execute breakpoint on the call instruction (reader B's signature + 14). It rewrites the two stack arguments: vertical FOV -> 2*atan(tan(v/2)*CullVertBoost), aspect -> aspect*widen/CullVertBoost. Horizontal coverage stays the same as the old boost, and the on-screen height scale barely changes.
 - Result at boost 30, dev PC: straight ahead about 13,850 draws/frame vs 10,120 with the FOV boost. Turned 60 deg: everything the FOV boost showed, plus small objects it had dropped.
+
+## Head-aimed culling (2026-11-15, v1.0.3)
+
+- The culling call (`swtor.exe+0x53bf15` site, function at `+0x77d4c0`) gets a pointer to a 4x4 **camera-to-world** matrix in rdx: rows 0-2 are the camera axes in world space, row 3 is the camera's world position. Turning the culling view with the head = mixing rows 0-2 by the head rotation and leaving row 3 alone. A first version multiplied every row (treating it as a view matrix), which moved the camera position: with a real headset the culling camera ended up outside the building and everything vanished.
+- The culling space is the eye-camera space with z mirrored: the rotation applied is S·E·S with S = diag(1,1,-1) (E = head rotation from the headset pose). Found by injecting fake headset orientations at the point the poses arrive and sweeping all mirror/transpose combinations at character select (draw counts).
+- Vertical FOV of the culling view = headset FOV x CullHeadMarginV2 (default 1.0, never narrower than the game). Horizontal = max(headset, game width x CullFovBoostV2 (default 2)). Higher widening makes small things far ahead pop in, so 2 is the tested sweet spot.
+- Split mode needs no camera address from the memory scan anymore. In some zones the scan found nothing and the whole culling help used to switch off until it did.
+- Old keys (`CullWiden`, `CullVertBoost`, `CullHeadAim`, `CullHeadMargin`, `HeadTracking`) are ignored, so old configs get the new defaults.

@@ -42,20 +42,55 @@ static bool g_haveCenter = false;
 static xrb::IpcPose g_pose[2];
 static xrb::IpcFov g_fov[2];
 static int64_t g_poseTime = 0;
+// Test aid: a fake head orientation injected into the poses exactly as they arrive from the headset, so everything
+// downstream (eyes, culling) sees it like a real head turn. Sweep: slow yaw + pitch circle (10 s period).
+static float g_fakeYaw = 0.f, g_fakePitch = 0.f, g_fakeRoll = 0.f, g_fakeSweep = 0.f;
+static void QMul(const float a[4], const float b[4], float o[4]) {   // x y z w, Hamilton
+    o[0] = a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1];
+    o[1] = a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0];
+    o[2] = a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3];
+    o[3] = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
+}
+static void FakePoses() {
+    float yaw = g_fakeYaw, pitch = g_fakePitch, roll = g_fakeRoll;
+    if (g_fakeSweep != 0.f) {
+        float t = GetTickCount() * (6.2831853f / 10000.f);
+        yaw += g_fakeSweep * sinf(t); pitch += 0.6f * g_fakeSweep * cosf(t);
+    }
+    if (yaw == 0.f && pitch == 0.f && roll == 0.f) return;
+    const float d = 3.14159265f / 360.f;   // half angle, degrees -> radians
+    float qy[4] = { 0, sinf(yaw * d), 0, cosf(yaw * d) }, qp[4] = { sinf(pitch * d), 0, 0, cosf(pitch * d) };
+    float qr[4] = { 0, 0, sinf(roll * d), cosf(roll * d) }, a[4], q[4];
+    QMul(qy, qp, a); QMul(a, qr, q);
+    float cx = 0.5f * (g_pose[0].px + g_pose[1].px), cy = 0.5f * (g_pose[0].py + g_pose[1].py), cz = 0.5f * (g_pose[0].pz + g_pose[1].pz);
+    for (int e = 0; e < 2; e++) {
+        xrb::IpcPose& p = g_pose[e];
+        float r[4] = { p.qx, p.qy, p.qz, p.qw }, o[4];
+        QMul(q, r, o);                       // turn the whole head (world-space rotation about the head centre)
+        p.qx = o[0]; p.qy = o[1]; p.qz = o[2]; p.qw = o[3];
+        float v[4] = { p.px - cx, p.py - cy, p.pz - cz, 0 }, qc[4] = { -q[0], -q[1], -q[2], q[3] }, t1[4], t2[4];
+        QMul(q, v, t1); QMul(t1, qc, t2);
+        p.px = cx + t2[0]; p.py = cy + t2[1]; p.pz = cz + t2[2];
+    }
+}
 static uint64_t g_stereoFrames = 0, g_monoFrames = 0;
 
 void Stereo_LoadSettings(const xrb::Config& c) {
     g_ss.enabled = c.GetBool("Stereo", true);
     g_ss.worldScale = c.GetFloat("WorldScale", 0.1f);
-    g_ss.headTracking = c.GetBool("HeadTracking", true);
+    g_ss.headTracking = c.GetBool("DebugHeadTracking", true);   // always on ("HeadTracking" is ignored)
     g_ss.fieldMask = c.GetInt("CamFieldMask", 7);
     g_ss.setProjection = c.GetBool("HeadsetProjection", true);
     g_ss.writeMode = c.GetInt("StereoWriteMode", 1);
     g_ss.debugSeparation = c.GetFloat("DebugEyeSeparation", 0.f);
     g_ss.debugFakeYawDeg = c.GetFloat("DebugFakeHeadYawDeg", 0.f);
     g_ss.debugFixedYawDeg = c.GetFloat("DebugFixedHeadYawDeg", 0.f);
+    g_ss.debugFixedPitchDeg = c.GetFloat("DebugFixedHeadPitchDeg", 0.f);
+    g_ss.debugFixedRollDeg = c.GetFloat("DebugFixedHeadRollDeg", 0.f);
     g_ss.refreshMode = c.GetInt("StereoRefreshMode", 1);
     g_ss.followers = c.GetBool("SkyFollowsHead", true);
+    g_fakeYaw = c.GetFloat("DebugPoseYawDeg", 0.f); g_fakePitch = c.GetFloat("DebugPosePitchDeg", 0.f);
+    g_fakeRoll = c.GetFloat("DebugPoseRollDeg", 0.f); g_fakeSweep = c.GetFloat("DebugPoseSweepDeg", 0.f);
 }
 const StereoSettings& Stereo_Settings() { return g_ss; }
 int Stereo_Pass() { return g_pass; }
@@ -68,6 +103,20 @@ static float g_gameP00 = 0, g_gameP11 = 0, g_gameNear = 0, g_gameFov = 0;
 float Stereo_GameFov() { return g_gameFov; }
 static float g_gameFar = 0;
 bool Stereo_GameNearFar(float* n, float* f) { if (g_gameNear <= 0 || g_gameFar <= 0) return false; *n = g_gameNear; *f = g_gameFar; return true; }
+// Head rotation relative to the game camera (camera space, row-vector form, rotation only) and the union of both
+// eyes' FOV tangents, for head-aimed culling. False until poses arrive or with head tracking off.
+bool Stereo_HeadRotation(float R[3][3], float tan4[4]) {
+    if (!g_ss.headTracking || g_poseTime == 0) return false;
+    const xrb::IpcPose& ps = g_pose[0];
+    Mat4 E = FromQuat(ps.qx, ps.qy, ps.qz, ps.qw);
+    if (g_ss.debugFixedYawDeg != 0.f) E = Mul(E, RotY(g_ss.debugFixedYawDeg * 3.14159265f / 180.f));
+    if (g_ss.debugFixedPitchDeg != 0.f) E = Mul(RotX(g_ss.debugFixedPitchDeg * 3.14159265f / 180.f), E);
+    if (g_ss.debugFixedRollDeg != 0.f) E = Mul(RotZ(g_ss.debugFixedRollDeg * 3.14159265f / 180.f), E);
+    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) R[r][c] = E.m[r][c];
+    float tl = tanf(g_fov[0].left), tr = tanf(g_fov[1].right), tu = tanf(g_fov[0].up), td = tanf(g_fov[0].down);
+    tan4[0] = fabsf(tl); tan4[1] = fabsf(tr); tan4[2] = fabsf(tu); tan4[3] = fabsf(td);
+    return tan4[0] > 0.1f && tan4[2] > 0.1f;
+}
 void Stereo_SetWorldScale(float w) { if (w > 0.001f) g_ss.worldScale = w; }
 bool Stereo_GameProjection(float* p00, float* p11, float* nearZ) {
     if (g_gameP00 <= 0 || g_gameP11 <= 0 || g_gameNear <= 0) return false;
@@ -92,6 +141,7 @@ bool Stereo_FilterActiveCamera(const void* data, uint8_t* out) {
     g_earlyPoses = false;
     if (!g_ss.enabled || g_ss.writeMode != 1 || g_shuttingDown || !Vr_StereoReady()) return false;
     if (!xrb::ClientGetLatestPoses(g_pose, g_fov, &g_poseTime)) return false;
+    FakePoses();
     memcpy(g_center, data, kCamSize);
     g_earlyPoses = true;
     BuildEye(0, out);
@@ -141,6 +191,8 @@ static void BuildEyeFrom(const uint8_t* center, int eye, uint8_t* out, bool rota
         E = Mul(E, RotY(a));
     }
     if (g_ss.debugFixedYawDeg != 0.f) E = Mul(E, RotY(g_ss.debugFixedYawDeg * 3.14159265f / 180.f));   // test aid: head turned
+    if (g_ss.debugFixedPitchDeg != 0.f) E = Mul(RotX(g_ss.debugFixedPitchDeg * 3.14159265f / 180.f), E);  // test aid: head tilted
+    if (g_ss.debugFixedRollDeg != 0.f) E = Mul(RotZ(g_ss.debugFixedRollDeg * 3.14159265f / 180.f), E);    // test aid: head rolled
     if (rotationOnly) { E.m[3][0] = E.m[3][1] = E.m[3][2] = 0.f; }
     Mat4 We = Mul(E, Wc);                          // eye -> world
     Mat4 Ve = InverseRigid(We);
@@ -232,7 +284,7 @@ static uintptr_t __fastcall Hk_NotifyRenderBegin(uintptr_t a, uintptr_t b, uintp
     if (b) memcpy(g_nrbArg, (const void*)b, sizeof(g_nrbArg));
     g_nrbRR = a;
     if (g_ss.enabled && !g_shuttingDown && g_haveCenter && !Vr_FlatMode() && Vr_StereoReady() &&
-        xrb::ClientGetLatestPoses(g_pose, g_fov, &g_poseTime) && Vr_BeginStereoFrame()) {
+        xrb::ClientGetLatestPoses(g_pose, g_fov, &g_poseTime) && (FakePoses(), true) && Vr_BeginStereoFrame()) {
         g_frameArmed = WriteEyeToNode(0);
     }
     return o_NotifyRenderBegin(a, b, c, d);

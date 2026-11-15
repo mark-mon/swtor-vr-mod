@@ -63,6 +63,12 @@ inline Mat4 RotY(float rad) {
     r.m[0][0] = c; r.m[0][2] = -s; r.m[2][0] = s; r.m[2][2] = c;
     return r;
 }
+inline Mat4 RotZ(float rad) {
+    Mat4 r = Mat4::Identity();
+    float c = cosf(rad), s = sinf(rad);
+    r.m[0][0] = c; r.m[0][1] = s; r.m[1][0] = -s; r.m[1][1] = c;
+    return r;
+}
 inline Mat4 RotX(float rad) {
     Mat4 r = Mat4::Identity();
     float c = cosf(rad), s = sinf(rad);

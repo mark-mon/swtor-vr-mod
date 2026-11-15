@@ -22,12 +22,13 @@ namespace svr {
 // Menu copies of the config values (vrkit edits these; they are written back on close).
 static struct {
     bool vr = true, pace = true, stereo = true, headTracking = true, shadowReuse = true, followers = true, clipCursor = true;
-    float worldScaleDisp = 1.0f, sceneScale = 1.0f, cullWiden = 30.0f, cullAspect = 1.0f, worldScale = 0.1f, sharpen = 0.f, sharpenClamp = 0.035f, sharpenRadius = 1.0f;
+    float worldScaleDisp = 1.0f, sceneScale = 1.0f, cullWiden = 2.0f, cullAspect = 1.0f, worldScale = 0.1f, sharpen = 0.f, sharpenClamp = 0.035f, sharpenRadius = 1.0f;
     bool hudLayer = true, hudFollowHead = false, drawCursor = true;
     float hudDistance = 1.4f, hudWidth = 1.6f, hudOffsetY = -0.05f;
     int cursorSize = 32;
     float theaterDistance = 2.5f, theaterWidth = 3.2f;
     int theaterAfterMs = 500;
+    bool cullHeadAim = true; float cullHeadMargin = 1.0f, cullVert = 1.0f; int cullHeadVariant = 0;
 } g_m;
 
 static bool g_inited = false, g_failed = false, g_changed = false, g_wasOpen = false;
@@ -66,13 +67,17 @@ void Menu_LoadSettings(const xrb::Config& c) {
     g_m.vr = c.GetBool("VR", true);
     g_m.stereo = c.GetBool("Stereo", true);
     g_m.pace = c.GetBool("PaceToHeadset", true);
-    g_m.headTracking = c.GetBool("HeadTracking", true);
+    g_m.headTracking = c.GetBool("DebugHeadTracking", true);
     g_m.shadowReuse = c.GetInt("ShadowReuse", 0) != 0;
     g_m.followers = c.GetBool("SkyFollowsHead", true);
     g_m.sceneScale = c.GetFloat("SceneScale", 1.0f);
     g_m.worldScale = c.GetFloat("WorldScale", 0.1f);
     g_m.worldScaleDisp = g_m.worldScale * 10.f;
-    g_m.cullWiden = c.GetFloat("CullWiden", 30.0f);
+    g_m.cullWiden = c.GetFloat("CullFovBoostV2", 2.0f);
+    g_m.cullHeadAim = c.GetBool("DebugCullHeadAim", true);
+    g_m.cullHeadMargin = c.GetFloat("CullHeadMarginV2", 1.0f);
+    g_m.cullVert = c.GetFloat("DebugCullVertBoost", 1.0f);
+    g_m.cullHeadVariant = c.GetInt("DebugCullHeadVariant", 0);
     g_m.cullAspect = c.GetFloat("CullAspect", 1.0f);
     g_m.sharpen = c.GetFloat("Sharpen", 0.f);
     g_m.sharpenClamp = c.GetFloat("SharpenClamp", 0.035f);
@@ -167,10 +172,6 @@ static void RegisterOptions() {
                  ". Key: RecenterKey in config.txt.").c_str());
     o.AddFloat("Display", "SceneScale", "Render scale", &g_m.sceneScale, 1.0f, 3.0f, 0.05f, 2,
                "3D resolution = game window x this. Game must be in Windowed display mode.", Changed);
-    o.AddFloat("Display", "CullWiden", "Culling FOV boost", &g_m.cullWiden, 1.0f, 30.0f, 0.5f, 1,
-               "Widens the game's own camera FOV so objects beside you are not culled when you turn your head (the VR "
-               "view is unchanged). Side effect: name plates / markers drawn by the game move toward the centre. "
-               "Off in flat mode. Costs some fps. Applies live.", [] { Cull_SetWiden(g_m.cullWiden); });
     auto applySharpen = [] { Sharpen_Set(g_m.sharpen, g_m.sharpenClamp, g_m.sharpenRadius); };
     o.AddFloat("Image", "Sharpen", "Luma sharpen strength", &g_m.sharpen, 0.0f, 10.0f, 0.05f, 2,
                "ReShade LumaSharpen strength. 0 = off. Applies live.", applySharpen);
@@ -181,7 +182,6 @@ static void RegisterOptions() {
     o.AddFloat("Display", "", "World scale", &g_m.worldScaleDisp, 0.2f, 10.0f, 0.1f, 1,
                "How big the world feels: 1.0 = normal (config WorldScale = value / 10). Larger = world feels smaller. Applies live.",
                [] { g_m.worldScale = g_m.worldScaleDisp * 0.1f; Stereo_SetWorldScale(g_m.worldScale); g_worldScaleDirty = true; });
-    o.AddBool("Display", "HeadTracking", "Head tracking", &g_m.headTracking, ap, Changed);
     o.AddBool("Display", "Stereo", "Stereo 3D", &g_m.stereo,
               ("Off: the game is shown on the theater screen. Quick switch in game: " + kFlat + " toggles VR / flat theater "
                "(e.g. for a broken movie). Keys in config.txt: FlatToggleKey, MenuKey, RecenterKey.").c_str(), Changed);
@@ -200,6 +200,13 @@ static void RegisterOptions() {
     o.AddFloat("Theater", "TheaterWidth", "Theater width (m)", &g_m.theaterWidth, 0.5f, 30.0f, 0.1f, 1, ap, Changed);
     o.AddInt("Theater", "TheaterAfterMs", "Theater after (ms without VR)", &g_m.theaterAfterMs, 100, 5000, 100,
              "Loading screens / movies switch to the theater after this long without a VR frame.", Changed);
+    auto applyHead = [] { CullSites_SetHead(g_m.cullHeadAim, g_m.cullHeadMargin, g_m.cullVert); };
+    o.AddFloat("Debug", "CullFovBoostV2", "Culling width", &g_m.cullWiden, 1.0f, 30.0f, 0.25f, 2,
+               "How far to the sides the game keeps drawing (the culling view also turns with your head). Default 2. "
+               "Higher can make small things far ahead pop in; 1 = culling help off. Applies live.",
+               [] { Cull_SetWiden(g_m.cullWiden); });
+    o.AddFloat("Debug", "CullHeadMarginV2", "Culling margin", &g_m.cullHeadMargin, 1.0f, 3.0f, 0.05f, 2,
+               "How much bigger than the headset's view the culling view is. Default 1.0. Applies live.", applyHead);
     o.AddAction("Debug", "Save logs for sending", [] { Log_SaveSnapshot(); },
                 "Copies the current logs to swtorvr\\logs\\ (with the time in the name) without stopping the game.");
     o.AddAction("Debug", "Reload mod now", [] { g_changed = true; vrkit::menu9::SetOpen(false); }, "Saves and reloads the mod.");
